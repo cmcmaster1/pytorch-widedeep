@@ -423,7 +423,7 @@ class TabTransformer(nn.Module):
             self.attention_weights = [None] * num_blocks
 
         if not mlp_hidden_dims:
-            mlp_inp_l = len(embed_input) * input_dim + cont_inp_dim
+            mlp_inp_l = (len(embed_input) + len(continuous_cols))* input_dim
             mlp_hidden_dims = [mlp_inp_l, mlp_inp_l * 4, mlp_inp_l * 2]
 
         self.tab_transformer_mlp = MLP(
@@ -455,7 +455,7 @@ class TabTransformer(nn.Module):
             x_cont = X[:, cont_idx].float()
             x_cont = self.continuous_embedding(x_cont)
             x_cont = self.embedding_dropout(x_cont)
-            x = torch.cat(embed, x_cont, 1)
+            x = torch.cat([x, x_cont.permute(1, 0, 2)], 1)
 
         for i, blk in enumerate(self.tab_transformer_blks):
             x = blk(x)
