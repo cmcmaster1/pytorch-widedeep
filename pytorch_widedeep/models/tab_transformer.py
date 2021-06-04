@@ -23,6 +23,18 @@ from torch import nn, einsum
 from pytorch_widedeep.wdtypes import *  # noqa: F403
 from pytorch_widedeep.models.tab_mlp import MLP, _get_activation_fn
 
+class ContinuousEmbedding(nn.Module):
+  def __init__(
+      self,
+      embedding_size: int
+  ):
+      super(ContinuousEmbedding, self).__init__()
+      self.relu = nn.ReLU()
+      self.embedding = nn.Linear(1, embedding_size)
+
+  def forward(self, X: Tensor) -> Tensor:
+      return self.relu(self.embedding(X.t().unsqueeze(2)))
+
 
 class PositionwiseFF(nn.Module):
     def __init__(
@@ -387,6 +399,7 @@ class TabTransformer(nn.Module):
         # Continuous
         if self.continuous_cols is not None:
             cont_inp_dim = len(self.continuous_cols)
+            self.continuous_embedding = ContinuousEmbedding(self.input_dim)
         else:
             cont_inp_dim = 0
 
@@ -437,15 +450,22 @@ class TabTransformer(nn.Module):
         if not self.shared_embed and self.embedding_dropout is not None:
             x = self.embedding_dropout(x)
 
+        if self.continuous_cols is not None:
+            cont_idx = [self.column_idx[col] for col in self.continuous_cols]
+            x_cont = X[:, cont_idx].float()
+            x_cont = self.continuous_embedding(x_cont)
+            x_cont = self.embedding_dropout(x_cont)
+            x = torch.cat(embed, x_cont, 1)
+
         for i, blk in enumerate(self.tab_transformer_blks):
             x = blk(x)
             if self.keep_attn_weights:
                 self.attention_weights[i] = blk.self_attn.attn_weights
         x = x.flatten(1)
 
-        if self.continuous_cols is not None:
-            cont_idx = [self.column_idx[col] for col in self.continuous_cols]
-            x_cont = X[:, cont_idx].float()
-            x = torch.cat([x, x_cont], 1)
+        #if self.continuous_cols is not None:
+        #    cont_idx = [self.column_idx[col] for col in self.continuous_cols]
+        #    x_cont = X[:, cont_idx].float()
+        #    x = torch.cat([x, x_cont], 1)
 
         return self.tab_transformer_mlp(x)
