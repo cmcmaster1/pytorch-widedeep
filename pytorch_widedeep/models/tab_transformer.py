@@ -33,7 +33,7 @@ class ContinuousEmbedding(nn.Module):
       self.embedding = nn.Linear(1, embedding_size)
 
   def forward(self, X: Tensor) -> Tensor:
-      return self.relu(self.embedding(X.t().unsqueeze(2)))
+      return self.relu(self.embedding(X.t().unsqueeze(2)).permute(1, 0, 2))
 
 
 class PositionwiseFF(nn.Module):
@@ -238,7 +238,7 @@ class TabTransformer(nn.Module):
         mlp_batchnorm: bool = False,
         mlp_batchnorm_last: bool = False,
         mlp_linear_first: bool = True,
-        embed_continuous: bool = True,
+        embed_continuous: bool = False,
     ):
 
         r"""TabTransformer model (https://arxiv.org/pdf/2012.06678.pdf) model that
@@ -318,6 +318,10 @@ class TabTransformer(nn.Module):
             Boolean indicating whether the order of the operations in the dense
             layer. If ``True: [LIN -> ACT -> BN -> DP]``. If ``False: [BN -> DP ->
             LIN -> ACT]``
+        embed_continuous: bool, default = False
+            Boolean indicating whether or not continuous variables should also be
+            embedded. If true, they will pass through a variable-specific linear
+            layer with ReLU activation (see https://arxiv.org/abs/2106.01342)
 
         Attributes
         ----------
@@ -332,6 +336,8 @@ class TabTransformer(nn.Module):
         output_dim: int
             The output dimension of the model. This is a required attribute
             neccesary to build the WideDeep class
+        continuous_embedding ``nn.Module``
+            Embeddings for the continuous variables
 
         Example
         --------
@@ -462,7 +468,7 @@ class TabTransformer(nn.Module):
             x_cont = X[:, cont_idx].float()
             x_cont = self.continuous_embedding(x_cont)
             x_cont = self.embedding_dropout(x_cont)
-            x = torch.cat([x, x_cont.permute(1, 0, 2)], 1)
+            x = torch.cat([x, x_cont], 1)
 
         for i, blk in enumerate(self.tab_transformer_blks):
             x = blk(x)
