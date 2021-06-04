@@ -238,6 +238,7 @@ class TabTransformer(nn.Module):
         mlp_batchnorm: bool = False,
         mlp_batchnorm_last: bool = False,
         mlp_linear_first: bool = True,
+        embed_continuous: bool = True,
     ):
 
         r"""TabTransformer model (https://arxiv.org/pdf/2012.06678.pdf) model that
@@ -368,6 +369,7 @@ class TabTransformer(nn.Module):
         self.mlp_batchnorm = mlp_batchnorm
         self.mlp_batchnorm_last = mlp_batchnorm_last
         self.mlp_linear_first = mlp_linear_first
+        self.embed_continuous = embed_continuous
 
         # Embeddings: val + 1 because 0 is reserved for padding/unseen cateogories.
         if shared_embed:
@@ -399,9 +401,11 @@ class TabTransformer(nn.Module):
         # Continuous
         if self.continuous_cols is not None:
             cont_inp_dim = len(self.continuous_cols)
-            self.continuous_embedding = ContinuousEmbedding(self.input_dim)
         else:
             cont_inp_dim = 0
+
+        if self.embed_continuous:
+            self.continuous_embedding = ContinuousEmbedding(self.input_dim)
 
         self.tab_transformer_blks = nn.Sequential()
         for i in range(num_blocks):
@@ -423,7 +427,10 @@ class TabTransformer(nn.Module):
             self.attention_weights = [None] * num_blocks
 
         if not mlp_hidden_dims:
-            mlp_inp_l = (len(embed_input) + len(continuous_cols))* input_dim
+            if embed_continuous:
+                mlp_inp_l = (len(embed_input) + cont_inp_dim) * input_dim
+            else:
+                mlp_inp_l = (len(embed_input) * input_dim) + cont_inp_dim
             mlp_hidden_dims = [mlp_inp_l, mlp_inp_l * 4, mlp_inp_l * 2]
 
         self.tab_transformer_mlp = MLP(
@@ -450,7 +457,7 @@ class TabTransformer(nn.Module):
         if not self.shared_embed and self.embedding_dropout is not None:
             x = self.embedding_dropout(x)
 
-        if self.continuous_cols is not None:
+        if self.continuous_cols is not None and self.embed_continuous:
             cont_idx = [self.column_idx[col] for col in self.continuous_cols]
             x_cont = X[:, cont_idx].float()
             x_cont = self.continuous_embedding(x_cont)
@@ -463,9 +470,9 @@ class TabTransformer(nn.Module):
                 self.attention_weights[i] = blk.self_attn.attn_weights
         x = x.flatten(1)
 
-        #if self.continuous_cols is not None:
-        #    cont_idx = [self.column_idx[col] for col in self.continuous_cols]
-        #    x_cont = X[:, cont_idx].float()
-        #    x = torch.cat([x, x_cont], 1)
+        if self.continuous_cols is not None and self.embed_continuous==False:
+            cont_idx = [self.column_idx[col] for col in self.continuous_cols]
+            x_cont = X[:, cont_idx].float()
+            x = torch.cat([x, x_cont], 1)
 
         return self.tab_transformer_mlp(x)
