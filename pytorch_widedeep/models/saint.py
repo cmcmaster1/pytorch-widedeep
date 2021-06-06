@@ -129,7 +129,78 @@ class MultiHeadedAttention(nn.Module):
 
         return self.out_proj(output)
 
-class TransformerEncoder(nn.Module):
+class IntersampleAttention(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        num_heads: int,
+        keep_attn_weights: bool,
+        dropout: float,
+        fixed_attention: bool,
+        num_cat_columns: int,
+        num_input_columns: int
+    ):
+        super(IntersampleAttention, self).__init__()
+
+        assert (
+            input_dim % num_heads == 0
+        ), "'input_dim' must be divisible by 'num_heads'"
+        if fixed_attention and not num_cat_columns:
+            raise ValueError(
+                "if 'fixed_attention' is 'True' the number of categorical "
+                "columns 'num_cat_columns' must be specified"
+            )
+        # Consistent with other implementations I assume d_v = d_k
+        self.input_dim = input_dim
+        self.d_k = input_dim // num_heads
+        self.num_heads = num_heads
+        self.dropout = nn.Dropout(dropout)
+        self.fixed_attention = fixed_attention
+        if fixed_attention:
+            self.inp_proj = nn.Linear(input_dim, input_dim)
+            self.fixed_key = nn.init.xavier_normal_(
+                nn.Parameter(torch.empty(num_cat_columns, input_dim))
+            )
+            self.fixed_query = nn.init.xavier_normal_(
+                nn.Parameter(torch.empty(num_cat_columns, input_dim))
+            )
+        else:
+            self.inp_proj = nn.Linear(input_dim * num_input_columns, input_dim * num_input_columns * 3)
+        self.out_proj = nn.Linear(input_dim, input_dim)
+        self.keep_attn_weights = keep_attn_weights
+
+    def forward(self, X):
+        # b: batch size, s: src seq length (num of categorical features
+        # encoded as embeddings), l: target sequence (l = s), e: embeddings
+        # dimensions, h: number of attention heads, d: d_k
+        # df: embedding dim * num of features
+        X = einops.rearrange(X, "b s e -> () b (s e)")
+        if self.fixed_attention:
+            v = self.inp_proj(X)
+            k = einops.repeat(
+                self.fixed_key.unsqueeze(0), "b s e -> (b copy) s e", copy=X.shape[0]
+            )
+            q = einops.repeat(
+                self.fixed_query.unsqueeze(0), "b s e -> (b copy) s e", copy=X.shape[0]
+            )
+        else:
+            q, k, v = self.inp_proj(X).chunk(3, dim=2)
+            
+        q, k, v = map(
+            lambda t: einops.rearrange(t, "() b (h df) -> () h b df", h=self.num_heads),
+            (q, k, v),
+        )
+        scores = einsum("b h s d, b h l d -> b h s l", q, k) / math.sqrt(self.d_k)
+        attn_weights = self.dropout(scores.softmax(dim=-1))
+        if self.keep_attn_weights:
+            self.attn_weights = attn_weights
+        attn_output = einsum("b h s l, b h l d -> b h s d", attn_weights, v)
+        output = einops.rearrange(attn_output, "() h b df -> () b (h df)", h=self.num_heads)
+        output = einops.rearrange(output, "() b (s e) -> b s e", e = self.input_dim)
+
+        return self.out_proj(output)
+        
+class SAINTTransformerEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int,
@@ -140,8 +211,9 @@ class TransformerEncoder(nn.Module):
         activation: str,
         fixed_attention,
         num_cat_columns,
+        num_input_columns,
     ):
-        super(TransformerEncoder, self).__init__()
+        super(SAINTTransformerEncoder, self).__init__()
         self.self_attn = MultiHeadedAttention(
             input_dim,
             num_heads,
@@ -150,27 +222,30 @@ class TransformerEncoder(nn.Module):
             fixed_attention,
             num_cat_columns,
         )
+        self.is_attn = IntersampleAttention(
+            input_dim,
+            num_heads,
+            keep_attn_weights,
+            dropout,
+            fixed_attention,
+            num_cat_columns,
+            num_input_columns,
+        )
         self.feed_forward = PositionwiseFF(
             input_dim, ff_hidden_dim, dropout, activation
         )
         self.attn_addnorm = AddNorm(input_dim, dropout)
-        self.ff_addnorm = AddNorm(input_dim, dropout)
+        self.is_attn_addnorm = AddNorm(input_dim, dropout)
+        self.ff_addnorm1 = AddNorm(input_dim, dropout)
+        self.ff_addnorm2 = AddNorm(input_dim, dropout)
 
     def forward(self, X: Tensor) -> Tensor:
-        Y = self.attn_addnorm(X, self.self_attn(X))
-        return self.ff_addnorm(Y, self.feed_forward(Y))
-
-
-class FullEmbeddingDropout(nn.Module):
-    def __init__(self, dropout: float):
-        super(FullEmbeddingDropout, self).__init__()
-        self.dropout = dropout
-
-    def forward(self, X: Tensor) -> Tensor:
-        mask = X.new().resize_((X.size(1), 1)).bernoulli_(1 - self.dropout).expand_as(
-            X
-        ) / (1 - self.dropout)
-        return mask * X
+        Y_self_attn = self.self_attn(X)
+        Y = self.attn_addnorm(X, Y_self_attn)
+        Y = self.ff_addnorm1(Y, self.feed_forward(Y))
+        Y_is_attn = self.is_attn(Y)
+        Y = self.is_attn_addnorm(Y, Y_is_attn)
+        return self.ff_addnorm2(Y, self.feed_forward(Y))
 
 
 class FullEmbeddingDropout(nn.Module):
@@ -224,7 +299,7 @@ class SharedEmbeddings(nn.Module):
         return out
 
 
-class TabTransformer(nn.Module):
+class SAINT(nn.Module):
     def __init__(
         self,
         column_idx: Dict[str, int],
@@ -249,7 +324,7 @@ class TabTransformer(nn.Module):
         mlp_batchnorm: bool = False,
         mlp_batchnorm_last: bool = False,
         mlp_linear_first: bool = True,
-        embed_continuous: bool = False,
+        embed_continuous: bool = True,
     ):
 
         r"""TabTransformer model (https://arxiv.org/pdf/2012.06678.pdf) model that
@@ -362,7 +437,7 @@ class TabTransformer(nn.Module):
         >>> model = TabTransformer(column_idx=column_idx, embed_input=embed_input, continuous_cols=continuous_cols)
         >>> out = model(X_tab)
         """
-        super(TabTransformer, self).__init__()
+        super(SAINT, self).__init__()
 
         self.column_idx = column_idx
         self.embed_input = embed_input
@@ -433,7 +508,7 @@ class TabTransformer(nn.Module):
         for i in range(num_blocks):
             self.tab_transformer_blks.add_module(
                 "block" + str(i),
-                TransformerEncoder(
+                SAINTTransformerEncoder(
                     input_dim,
                     num_heads,
                     keep_attn_weights,
